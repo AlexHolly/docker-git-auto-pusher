@@ -1,0 +1,225 @@
+services:
+  git-smart-push:
+    image: alpine:latest
+    container_name: obsidian-vault-git
+    environment:
+      - GIT_EMAIL="your.email@example.com"
+      - GIT_NAME="Your Name"
+      - GIT_REPO=git@github.com:username/repo.git
+      - CRON_SCHEDULE=0 3 * * *
+      - TZ=Europe/Berlin
+    volumes:
+      - /volume1/docker/obsidian/repo:/repo
+      - /volume1/docker/obsidian/ssh:/root/.ssh
+    command: |
+      /bin/sh -c '
+
+      # Install tools
+      apk add --no-cache tzdata git openssh-client
+
+      # Git safe directory
+      git config --global --add safe.directory /repo
+      git config --global pull.rebase false
+      git config --global pull.ff only
+      git config --global merge.ff false
+      git config --global user.email $$GIT_EMAIL
+      git config --global user.name $$GIT_NAME
+
+      # SSH Key nur generieren wenn nicht existiert
+      echo "Checking for existing SSH key..."
+      if [ -f /root/.ssh/id_rsa ]; then
+        echo "✅ Using EXISTING SSH key from host folder"
+        echo "Fingerprint:"
+        ssh-keygen -lf /root/.ssh/id_rsa.pub 2>/dev/null || echo "Could not read key"
+      else
+        echo "🔑 Generating NEW SSH key in host folder..."
+        mkdir -p /root/.ssh
+        ssh-keygen -t rsa -b 2048 -f /root/.ssh/id_rsa -N "" -q
+
+        echo ""
+        echo "========================================="
+        echo "NEW SSH PUBLIC KEY (add to Git server):"
+        echo "========================================="
+        cat /root/.ssh/id_rsa.pub
+        echo "========================================="
+        echo ""
+
+        echo "⚠️  IMPORTANT: Add this key to GitHub/GitLab!"
+        echo "   Path on host: /home/DEINNAME/docker/git-pusher/ssh/id_rsa.pub"
+        echo ""
+
+        echo "Waiting 30 seconds for you to copy the key..."
+        sleep 30
+      fi
+
+      # Set permissions
+      chmod 700 /root/.ssh 2>/dev/null || true
+      chmod 600 /root/.ssh/id_rsa 2>/dev/null || true
+
+      ssh-keyscan github.com > /root/.ssh/known_hosts
+
+      if [ ! -d /repo/.git ]; then
+        cd /repo
+        git init
+        git remote add origin $$GIT_REPO
+        git checkout -b main
+
+        # Prüfen ob remote bereits Inhalt hat
+        if git ls-remote --heads origin main | grep -q main; then
+          echo "📥 Remote hat bereits Inhalt - pull mit merge-strategie..."
+
+          # Ersten Commit machen NUR wenn Dateien existieren
+          if [ "$(ls -A)" ]; then
+            git add .
+            git commit -m "Lokaler Stand vor erstem Merge"
+          else
+            echo "📂 Keine lokalen Dateien - erstelle leeren Commit nicht"
+          fi
+
+          # Remote holen
+          git fetch origin main
+
+          # Wenn keine lokalen Commits, einfach reset zu remote
+          if ! git rev-parse HEAD 2>/dev/null; then
+            echo "📋 Keine lokalen Commits - übernehme remote"
+            git reset --hard origin/main
+          else
+            # Sonst mergen
+            git merge origin/main --allow-unrelated-histories --no-commit || true
+
+            # Bei Konflikten: BEIDE Versionen behalten
+            if git status --porcelain | grep -q "^UU"; then
+              echo "⚠️  Konflikte - behalte BEIDE Versionen"
+              git status --porcelain | grep "^UU" | while read status file; do
+              echo "   Konflikt in: $$file"
+              echo "# ===== REMOTE VERSION =====" > "$$file"
+              git show :2:"$$file" 2>/dev/null >> "$$file" || echo "" >> "$$file"
+              echo "" >> "$$file"
+              echo "# ===== LOKALE VERSION =====" >> "$$file"
+              git show :3:"$$file" 2>/dev/null >> "$$file" || echo "" >> "$$file"
+              git add "$$file"
+              done
+              git commit -m "Merge: lokale Änderungen mit remote"
+            else
+              git commit -m "Merge: lokale Änderungen mit remote"
+            fi
+          fi
+
+          # Pushen NUR wenn es Commits gibt
+          if git rev-parse HEAD 2>/dev/null; then
+            git push -u origin main
+          else
+            echo "⚠️  Keine Commits zum pushen"
+          fi
+
+        else
+          # Remote ist leer - einfacher Init NUR wenn Dateien existieren
+          if [ "$(ls -A)" ]; then
+            git add .
+            git commit -m "init"
+            git push -u origin main
+            echo "✅ Repository initialisiert mit $(ls -A | wc -l) Dateien"
+          else
+           echo "📂 Keine lokalen Dateien - Repository bleibt leer"
+          fi
+        fi
+        echo "✅ Repository initialisiert"
+      fi
+
+      if git branch | grep -q "master"; then
+        echo "Renaming master to main..."
+        git branch -m master main
+      fi
+
+      echo "Testing SSH connection..."
+      ssh -T git@github.com 2>&1 | grep -i "successfully\|authenticated" || echo "SSH test completed"
+
+      # Safe merge: Pull squashed remote, then apply local changes
+      cat > /root/safe_merge.sh << 'EOF'
+      #!/bin/sh
+      safe_merge() {
+        cd /repo
+        echo "🔄 Starting safe merge..."
+        # Prüfe ob bereits Konflikte existieren
+
+        if git status --porcelain | grep -q "^UU"; then
+          echo "⚠️  Es gibt bereits lokale Konflikte!"
+          echo "📁 Konflikt-Dateien:"
+          git status --porcelain | grep "^UU" | cut -d" " -f2
+          echo "❌ Backup abgebrochen - löse zuerst die Konflikte lokal!"
+          exit 1
+        fi
+
+        # Save current local state
+        local current_branch=$$(git rev-parse --abbrev-ref HEAD)
+        echo "Current branch: $$current_branch"
+
+        # Stash ALL local changes (committed and uncommitted)
+        echo "💾 Stashing local changes..."
+        git stash push --include-untracked -m "local-changes-$$(date +%s)"
+
+        # Reset to remote squashed commit (THIS IS THE KEY CHANGE)
+        echo "⬇️  Pulling squashed remote changes..."
+        git fetch origin main
+        git reset --hard origin/main
+
+        # Now apply local changes from stash on top of remote
+        echo "💾 Applying local changes on top of remote..."
+        if git stash pop; then
+          echo "✅ Local changes applied successfully"
+        else
+          echo "⚠️  Stash had conflicts - keeping both versions"
+
+          # For conflicted files, keep BOTH local and remote
+          git status --porcelain | grep "^UU" | while read status file; do
+          echo "   Merging conflicted file: $$file"
+
+          # Backup conflicted version
+          cp "$$file" "$$file.backup"
+
+          # Get stashed (local) version
+          local local_content=$$(git show :1:"$$file" 2>/dev/null || echo "# Local version")
+
+          # Get current (remote) version  
+          local remote_content=$$(cat "$$file" 2>/dev/null || echo "# Remote version")
+
+          # Combine: remote first, then local
+          echo "# ===== REMOTE VERSION (squashed) =====" > "$$file"
+          echo "$$remote_content" >> "$$file"
+          echo "" >> "$$file"
+          echo "# ===== LOCAL VERSION =====" >> "$$file"
+          echo "$$local_content" >> "$$file"
+
+          rm -f "$$file.backup"
+          git add "$$file" 2>/dev/null || true
+          done
+
+          # Commit the merged result
+          git commit -m "Merge: local changes with remote squashed" 2>/dev/null || true
+        fi
+
+        git add -A && git commit --allow-empty -m "backup" && git push origin main --force
+
+        echo "✅ Safe merge completed"
+      }
+
+      safe_merge
+      EOF
+
+      chmod +x /root/safe_merge.sh
+
+      # Run safe merge immediately on container start
+      /root/safe_merge.sh
+
+      # Cron job: daily backup + safe merge
+      echo "$${CRON_SCHEDULE:-0 3 * * *} /root/safe_merge.sh" > /etc/crontabs/root
+
+      echo ""
+      echo "✅ Git Auto-Pusher started successfully!"
+      echo "⏰ Will push daily at 03:00"
+      echo "💾 SSH keys stored in: /home/DEINNAME/docker/git-pusher/ssh/"
+      echo ""
+
+      crond -f
+      '
+    restart: unless-stopped
